@@ -41,11 +41,18 @@ struct proc {
 	/*
 	* LAB1: you may need to add some new fields here
 	*/
+	uint64 start_time;
+	unsigned int syscall_times[500];
 };
 
 /*
 * LAB1: you may need to define struct for TaskInfo here
 */
+typedef struct TaskInfo {
+    int status;
+    unsigned int syscall_times[500];
+    int time;
+} TaskInfo;
 
 struct proc *curr_proc();
 void exit(int);

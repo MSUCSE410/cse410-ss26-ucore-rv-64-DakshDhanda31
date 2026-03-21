@@ -4,6 +4,7 @@
 #include "syscall_ids.h"
 #include "timer.h"
 #include "trap.h"
+#include "vm.h"
 
 uint64 sys_write(int fd, uint64 va, uint len)
 {
@@ -34,24 +35,75 @@ uint64 sys_sched_yield()
 
 uint64 sys_gettimeofday(TimeVal *val, int _tz) // TODO: implement sys_gettimeofday in pagetable. (VA to PA)
 {
-	// YOUR CODE
-	val->sec = 0;
-	val->usec = 0;
-
-	/* The code in `ch3` will leads to memory bugs*/
-
-	// uint64 cycle = get_cycle();
-	// val->sec = cycle / CPU_FREQ;
-	// val->usec = (cycle % CPU_FREQ) * 1000000 / CPU_FREQ;
-	return 0;
+	uint64 cycle = get_cycle();
+    struct proc *p = curr_proc();
+    TimeVal *physical_val = (TimeVal *)useraddr(p->pagetable, (uint64)val);
+    if (physical_val == 0) return -1;
+    physical_val->sec = cycle / CPU_FREQ;
+    physical_val->usec = (cycle % CPU_FREQ) * 1000000 / CPU_FREQ;
+    return 0;
 }
 
 // TODO: add support for mmap and munmap syscall.
 // hint: read through docstrings in vm.c. Watching CH4 video may also help.
 // Note the return value and PTE flags (especially U,X,W,R)
-/*
+
+
+uint64 sys_mmap(uint64 start, uint64 len, int port, int flag, int fd)
+{
+    if (port & ~0x7) return -1;
+    if (!(port & 0x7)) return -1;
+    if (start % PAGE_SIZE != 0) return -1;
+    if (len == 0) return 0;
+    if (len > 1024 * 1024 * 1024) return -1;
+    
+    len = PGROUNDUP(len);
+    struct proc *p = curr_proc();
+    
+    int perm = PTE_U;
+    if (port & 1) perm |= PTE_R;
+    if (port & 2) perm |= PTE_W;
+    if (port & 4) perm |= PTE_X;
+    
+    for (uint64 va = start; va < start + len; va += PAGE_SIZE) {
+        if (walkaddr(p->pagetable, va) != 0) return -1;
+        void *pa = kalloc();
+        if (pa == 0) return -1;
+        memset(pa, 0, PAGE_SIZE);
+        if (mappages(p->pagetable, va, PAGE_SIZE, (uint64)pa, perm) != 0) return -1;
+    }
+    return 0;
+}
+
+uint64 sys_munmap(uint64 start, uint64 len)
+{
+    if (start % PAGE_SIZE != 0) return -1;
+    if (len == 0) return 0;
+    
+    len = PGROUNDUP(len);
+    struct proc *p = curr_proc();
+    
+    for (uint64 va = start; va < start + len; va += PAGE_SIZE) {
+        if (walkaddr(p->pagetable, va) == 0) return -1;
+    }
+    
+    uvmunmap(p->pagetable, start, len / PAGE_SIZE, 1);
+    return 0;
+}
+/*	
 * LAB1: you may need to define sys_task_info here
 */
+int sys_task_info(TaskInfo *ti) {
+    struct proc *p = curr_proc();
+    TaskInfo *physical_ti = (TaskInfo *)useraddr(p->pagetable, (uint64)ti);
+    if (physical_ti == 0) return -1;
+    physical_ti->status = 2;
+    for (int i = 0; i < 500; i++) {
+        physical_ti->syscall_times[i] = p->syscall_times[i];
+    }
+    physical_ti->time = (int)((get_cycle() - p->start_time) / (CPU_FREQ / 1000));
+    return 0;
+}
 
 extern char trap_page[];
 
@@ -66,7 +118,19 @@ void syscall()
 	/*
 	* LAB1: you may need to update syscall counter for task info here
 	*/
+	curr_proc()->syscall_times[id]++;
 	switch (id) {
+
+	case SYS_mmap:
+		ret = sys_mmap(args[0], args[1], args[2], args[3], args[4]);
+		break;
+	case SYS_munmap:
+		ret = sys_munmap(args[0], args[1]);
+		break;
+
+	case SYS_task_info:
+    	ret = sys_task_info((TaskInfo *)args[0]);
+    	break;
 	case SYS_write:
 		ret = sys_write(args[0], args[1], args[2]);
 		break;
