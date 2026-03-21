@@ -38,8 +38,9 @@ struct proc {
 	/*
 	* LAB1: you may need to add some new fields here
 	*/
-	uint64 start_time;
-	unsigned int syscall_times[500];
+	uint64 start_time; // when the task started running
+	unsigned int syscall_times[500];// counts how many times each syscall was used
+
 };
 
 /*

@@ -35,6 +35,7 @@ void proc_init(void)
 		/*
 		* LAB1: you may need to initialize your new fields of proc here
 		*/
+		//initialized the new fields to zero for every process.when the OS boots, everything must start clean
 		p->start_time = 0;
 		memset(p->syscall_times, 0, sizeof(p->syscall_times));
 	}
@@ -87,6 +88,7 @@ void scheduler(void)
 				/*
 				* LAB1: you may need to init proc start time here
 				*/
+				//recording the when the process starts running for the first time 
 				if (p->start_time == 0) {
     			p->start_time = get_cycle();
 }
