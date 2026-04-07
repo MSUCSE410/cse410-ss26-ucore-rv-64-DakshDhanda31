@@ -5,6 +5,9 @@
 #include "syscall_ids.h"
 #include "timer.h"
 #include "trap.h"
+#include "vm.h"
+#include "timer.h"
+#define SYS_taskinfo 410
 
 uint64 sys_write(int fd, uint64 va, uint len)
 {
@@ -92,15 +95,93 @@ uint64 sys_wait(int pid, uint64 va)
 	return wait(pid, code);
 }
 
+uint64 sys_mmap(uint64 start, uint64 len, int port, int flag, int fd)
+{
+	if (port & ~0x7) return -1;
+	if (!(port & 0x7)) return -1;
+	if (start % PAGE_SIZE != 0) return -1;
+	if (len == 0) return 0;
+	if (len > 1024 * 1024 * 1024) return -1;
+
+	len = PGROUNDUP(len);
+	struct proc *p = curr_proc();
+
+	int perm = PTE_U;
+	if (port & 1) perm |= PTE_R;
+	if (port & 2) perm |= PTE_W;
+	if (port & 4) perm |= PTE_X;
+
+	for (uint64 va = start; va < start + len; va += PAGE_SIZE) {
+		if (walkaddr(p->pagetable, va) != 0) return -1;
+		void *pa = kalloc();
+		if (pa == 0) return -1;
+		memset(pa, 0, PAGE_SIZE);
+		if (mappages(p->pagetable, va, PAGE_SIZE, (uint64)pa, perm) != 0) return -1;
+	}
+	return 0;
+}
+
+uint64 sys_munmap(uint64 start, uint64 len)
+{
+	if (start % PAGE_SIZE != 0) return -1;
+	if (len == 0) return 0;
+
+	len = PGROUNDUP(len);
+	struct proc *p = curr_proc();
+
+	for (uint64 va = start; va < start + len; va += PAGE_SIZE) {
+		if (walkaddr(p->pagetable, va) == 0) return -1;
+	}
+
+	uvmunmap(p->pagetable, start, len / PAGE_SIZE, 1);
+	return 0;
+}
+
+int sys_task_info(uint64 va)
+{
+	struct proc *p = curr_proc();
+	char buf[sizeof(int) + 500 * sizeof(unsigned int) + sizeof(int)];
+	int status = 2;
+	int time_ms = (int)((get_cycle() - p->start_time) / (CPU_FREQ / 1000));
+	int offset = 0;
+	memmove(buf + offset, &status, sizeof(int));
+	offset += sizeof(int);
+	memmove(buf + offset, p->syscall_times, 500 * sizeof(unsigned int));
+	offset += 500 * sizeof(unsigned int);
+	memmove(buf + offset, &time_ms, sizeof(int));
+	offset += sizeof(int);
+	copyout(p->pagetable, va, buf, offset);
+	return 0;
+}
+
 uint64 sys_spawn(uint64 va)
 {
 	// TODO: your job is to complete the sys call
-	return -1;
+	struct proc *p = curr_proc();
+	char name[200];
+	copyinstr(p->pagetable, name, va, 200);
+	debugf("sys_spawn %s\n", name);
+	int id = get_id_by_name(name);
+	if (id < 0)
+			return -1;
+	struct proc *np = allocproc();
+	if (np == NULL)
+			return -1;
+	loader(id, np);
+	np->parent = p;
+	add_task(np);
+	return np->pid;
+
 }
 
 uint64 sys_set_priority(long long prio){
     // TODO: your job is to complete the sys call
-    return -1;
+	if (prio < 2)
+        return -1;
+    struct proc *p = curr_proc();
+    p->priority = prio;
+    p->pass = 65536 / prio;
+    return prio;
 }
 
 
@@ -114,6 +195,7 @@ void syscall()
 			   trapframe->a3, trapframe->a4, trapframe->a5 };
 	tracef("syscall %d args = [%x, %x, %x, %x, %x, %x]", id, args[0],
 	       args[1], args[2], args[3], args[4], args[5]);
+	curr_proc()->syscall_times[id]++;
 	switch (id) {
 	case SYS_write:
 		ret = sys_write(args[0], args[1], args[2]);
@@ -145,9 +227,23 @@ void syscall()
 	case SYS_wait4:
 		ret = sys_wait(args[0], args[1]);
 		break;
+
 	case SYS_spawn:
 		ret = sys_spawn(args[0]);
 		break;
+	case SYS_mmap:
+		ret = sys_mmap(args[0], args[1], args[2], args[3], args[4]);
+		break;
+	case SYS_munmap:
+		ret = sys_munmap(args[0], args[1]);
+		break;
+	case SYS_taskinfo:
+		ret = sys_task_info(args[0]);
+		break;
+	case SYS_setpriority:
+		ret = sys_set_priority(args[0]);
+		break;
+	
 	default:
 		ret = -1;
 		errorf("unknown syscall %d", id);
