@@ -2,9 +2,15 @@
 #include "console.h"
 #include "defs.h"
 #include "loader.h"
+#include "fs.h"
+#include "file.h"
 #include "syscall_ids.h"
 #include "timer.h"
 #include "trap.h"
+#include "vm.h"
+#include "timer.h"
+#define SYS_taskinfo 410
+
 
 uint64 console_write(uint64 va, uint64 len)
 {
@@ -142,16 +148,95 @@ uint64 sys_wait(int pid, uint64 va)
 	return wait(pid, code);
 }
 
+uint64 sys_mmap(uint64 start, uint64 len, int port, int flag, int fd)
+{
+        if (port & ~0x7) return -1;
+        if (!(port & 0x7)) return -1;
+        if (start % PAGE_SIZE != 0) return -1;
+        if (len == 0) return 0;
+        if (len > 1024 * 1024 * 1024) return -1;
+
+        len = PGROUNDUP(len);
+        struct proc *p = curr_proc();
+
+        int perm = PTE_U;
+        if (port & 1) perm |= PTE_R;
+        if (port & 2) perm |= PTE_W;
+        if (port & 4) perm |= PTE_X;
+
+        for (uint64 va = start; va < start + len; va += PAGE_SIZE) {
+                if (walkaddr(p->pagetable, va) != 0) return -1;
+                void *pa = kalloc();
+                if (pa == 0) return -1;
+                memset(pa, 0, PAGE_SIZE);
+                if (mappages(p->pagetable, va, PAGE_SIZE, (uint64)pa, perm) != 0) return -1;
+        }
+        return 0;
+}
+
+uint64 sys_munmap(uint64 start, uint64 len)
+{
+        if (start % PAGE_SIZE != 0) return -1;
+        if (len == 0) return 0;
+
+        len = PGROUNDUP(len);
+        struct proc *p = curr_proc();
+
+        for (uint64 va = start; va < start + len; va += PAGE_SIZE) {
+                if (walkaddr(p->pagetable, va) == 0) return -1;
+        }
+
+        uvmunmap(p->pagetable, start, len / PAGE_SIZE, 1);
+        return 0;
+}
+
+int sys_task_info(uint64 va)
+{
+        struct proc *p = curr_proc();
+        char buf[sizeof(int) + 500 * sizeof(unsigned int) + sizeof(int)];
+        int status = 2;
+        int time_ms = (int)((get_cycle() - p->start_time) / (CPU_FREQ / 1000));
+        int offset = 0;
+        memmove(buf + offset, &status, sizeof(int));
+        offset += sizeof(int);
+        memmove(buf + offset, p->syscall_times, 500 * sizeof(unsigned int));
+        offset += 500 * sizeof(unsigned int);
+        memmove(buf + offset, &time_ms, sizeof(int));
+        offset += sizeof(int);
+        copyout(p->pagetable, va, buf, offset);
+        return 0;
+}
+
 uint64 sys_spawn(uint64 va)
 {
-	// TODO: your job is to complete the sys call
-	return -1;
+        struct proc *p = curr_proc();
+        char name[200];
+        copyinstr(p->pagetable, name, va, 200);
+        debugf("sys_spawn %s\n", name);
+        struct inode *ip = namei(name);
+        if (ip == 0)
+                return -1;
+        struct proc *np = allocproc();
+        if (np == NULL) {
+                iput(ip);
+                return -1;
+        }
+        bin_loader(ip, np);
+        iput(ip);
+        init_stdio(np);
+        np->parent = p;
+        add_task(np);
+        return np->pid;
 }
 
 uint64 sys_set_priority(long long prio)
 {
-	// TODO: your job is to complete the sys call
-	return -1;
+	if (prio < 2)
+        return -1;
+	struct proc *p = curr_proc();
+	p->priority = prio;
+	p->pass = 65536 / prio;
+	return prio;
 }
 
 uint64 sys_openat(uint64 va, uint64 omode, uint64 _flags)
@@ -178,19 +263,82 @@ uint64 sys_close(int fd)
 }
 
 int sys_fstat(int fd,uint64 stat){
-	//TODO: your job is to complete the syscall
-	return -1;
+	if (fd < 0 || fd >= FD_BUFFER_SIZE)
+			return -1;
+	struct proc *p = curr_proc();
+	struct file *f = p->files[fd];
+	if (f == NULL || f->type != FD_INODE)
+			return -1;
+	struct inode *ip = f->ip;
+	ivalid(ip);
+	// Stat struct: uint64 dev, uint64 ino, uint32 mode, uint32 nlink, uint64 pad[7]
+	char buf[80];
+	memset(buf, 0, sizeof(buf));
+	uint64 dev = 0;
+	uint64 ino = ip->inum;
+	uint32 mode = (ip->type == T_DIR) ? 0x040000 : 0x100000;
+	uint32 nlink = ip->nlink;
+	memmove(buf, &dev, sizeof(uint64));
+	memmove(buf + 8, &ino, sizeof(uint64));
+	memmove(buf + 16, &mode, sizeof(uint32));
+	memmove(buf + 20, &nlink, sizeof(uint32));
+	copyout(p->pagetable, stat, buf, sizeof(buf));
+	return 0;
 }
 
 int sys_linkat(int olddirfd, uint64 oldpath, int newdirfd, uint64 newpath, uint64 flags){
-	//TODO: your job is to complete the syscall
-	return -1;
+	struct proc *p = curr_proc();
+	char old[200], new[200];
+	copyinstr(p->pagetable, old, oldpath, 200);
+	copyinstr(p->pagetable, new, newpath, 200);
+	// Cannot link to same name
+	if (strncmp(old, new, 200) == 0)
+			return -1;
+	// Find the old file
+	struct inode *ip = namei(old);
+	if (ip == 0)
+			return -1;
+	ivalid(ip);
+	// Add new directory entry pointing to same inode
+	struct inode *dp = root_dir();
+	if (dirlink(dp, new, ip->inum) < 0) {
+			iput(dp);
+			iput(ip);
+			return -1;
+	}
+	ip->nlink++;
+	iupdate(ip);
+	iput(dp);
+	iput(ip);
+	return 0;
 }
 
+
 int sys_unlinkat(int dirfd, uint64 name, uint64 flags){
-	//TODO: your job is to complete the syscall
-	return -1;
+	struct proc *p = curr_proc();
+	char path[200];
+	copyinstr(p->pagetable, path, name, 200);
+	// Find the file
+	struct inode *dp = root_dir();
+	uint off;
+	struct inode *ip = dirlookup(dp, path, &off);
+	if (ip == 0) {
+		iput(dp);
+		return -1;
+	}
+	ivalid(ip);
+	// Clear the directory entry
+	struct dirent de;
+	memset(&de, 0, sizeof(de));
+	writei(dp, 0, (uint64)&de, off, sizeof(de));
+	iput(dp);
+	// Decrement link count
+	ip->nlink--;
+	iupdate(ip);
+	iput(ip);
+	return 0;
 }
+
 
 extern char trap_page[];
 
@@ -202,6 +350,7 @@ void syscall()
 			   trapframe->a3, trapframe->a4, trapframe->a5 };
 	tracef("syscall %d args = [%x, %x, %x, %x, %x, %x]", id, args[0],
 	       args[1], args[2], args[3], args[4], args[5]);
+	curr_proc()->syscall_times[id]++;
 	switch (id) {
 	case SYS_write:
 		ret = sys_write(args[0], args[1], args[2]);
@@ -247,9 +396,23 @@ void syscall()
 		break;
 	case SYS_unlinkat:
 	    ret = sys_unlinkat(args[0],args[1],args[2]);
+		break;
 	case SYS_spawn:
 		ret = sys_spawn(args[0]);
 		break;
+	case SYS_setpriority:
+			ret = sys_set_priority(args[0]);
+			break;
+	case SYS_mmap:
+			ret = sys_mmap(args[0], args[1], args[2], args[3], args[4]);
+			break;
+	case SYS_munmap:
+			ret = sys_munmap(args[0], args[1]);
+			break;
+	case SYS_taskinfo:
+			ret = sys_task_info(args[0]);
+			break;
+
 	default:
 		ret = -1;
 		errorf("unknown syscall %d", id);

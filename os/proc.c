@@ -4,6 +4,7 @@
 #include "trap.h"
 #include "vm.h"
 #include "queue.h"
+#include "timer.h"
 
 struct proc pool[NPROC];
 __attribute__((aligned(16))) char kstack[NPROC][PAGE_SIZE];
@@ -37,6 +38,11 @@ void proc_init()
 		p->state = UNUSED;
 		p->kstack = (uint64)kstack[p - pool];
 		p->trapframe = (struct trapframe *)trapframe[p - pool];
+		p->start_time = 0;
+		memset(p->syscall_times, 0, sizeof(p->syscall_times));
+		p->stride = 0;
+		p->priority = 16;
+		p->pass = 65536 / 16;
 	}
 	idle.kstack = (uint64)boot_stack_top;
 	idle.pid = IDLE_PID;
@@ -52,20 +58,22 @@ int allocpid()
 
 struct proc *fetch_task()
 {
-	int index = pop_queue(&task_queue);
-	if (index < 0) {
-		debugf("No task to fetch\n");
-		return NULL;
+	struct proc *min_proc = NULL;
+	uint64 min_stride = ~0ULL;
+	for (struct proc *p = pool; p < &pool[NPROC]; p++) {
+		if (p->state == RUNNABLE && p->stride < min_stride) {
+			min_stride = p->stride;
+			min_proc = p;
+		}
 	}
-	debugf("fetch task %d(pid=%d) from task queue\n", index,
-	       pool[index].pid);
-	return pool + index;
+	if (min_proc != NULL) {
+		min_proc->stride += min_proc->pass;
+	}
+	return min_proc;
 }
-
 void add_task(struct proc *p)
 {
-	push_queue(&task_queue, p - pool);
-	debugf("add task %d(pid=%d) to task queue\n", p - pool, p->pid);
+	debugf("add task %d(pid=%d)\n", p - pool, p->pid);
 }
 
 // Look in the process table for an UNUSED proc.
@@ -94,6 +102,12 @@ found:
 	memset((void *)p->kstack, 0, KSTACK_SIZE);
 	memset((void *)p->trapframe, 0, TRAP_PAGE_SIZE);
 	memset((void *)p->files, 0, sizeof(struct file *) * FD_BUFFER_SIZE);
+
+	p->start_time = 0;
+	memset(p->syscall_times, 0, sizeof(p->syscall_times));
+	p->stride = 0;
+	p->priority = 16;
+	p->pass = 65536 / 16;	
 	p->context.ra = (uint64)usertrapret;
 	p->context.sp = p->kstack + KSTACK_SIZE;
 	return p;
@@ -137,6 +151,8 @@ void scheduler()
 			panic("all app are over!\n");
 		}
 		tracef("swtich to proc %d", p - pool);
+		if (p->start_time == 0)
+            p->start_time = get_cycle();
 		p->state = RUNNING;
 		current_proc = p;
 		swtch(&idle.context, &p->context);
